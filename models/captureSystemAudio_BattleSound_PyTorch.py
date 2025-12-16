@@ -13,22 +13,24 @@ from pathlib import Path
 # --- CONFIG ---
 MODEL_PATH = Path("C:/Users/egrandjean/Desktop/BattleSound_model/BattleSound/models/best_model.pt")
 
-# CRITICAL FIX: Distinguish between Capture Rate and Model Rate
-SYSTEM_RATE = 48000  # Your mic/cable output (usually 44100 or 48000)
-MODEL_RATE = 16000  # What the AI was trained on
-DURATION = 0.5  # Seconds
+# AUDIO RATES
+SYSTEM_RATE = 48000  # Input device rate
+MODEL_RATE = 16000  # AI Model rate
+DURATION = 0.5  # Window size for prediction
+UPDATE_INTERVAL = 0.1  # How often we predict (Sliding Window step)
 
-# We capture more samples to get the same duration in real time
-CAPTURE_SIZE = int(SYSTEM_RATE * DURATION)
+# CALCULATED SIZES
+WINDOW_SIZE = int(SYSTEM_RATE * DURATION)  # 24000 samples (0.5s)
+STEP_SIZE = int(SYSTEM_RATE * UPDATE_INTERVAL)  # 4800 samples (0.1s)
 
 CLASS_LABELS = {0: "Nothing", 1: "Voices", 2: "Effects"}
 HISTORY_SIZE = 100
-GAIN_FACTOR = 5.0
+GAIN_FACTOR = 3.0  # Reduced slightly since we are filtering noise
 
 data_queue = queue.Queue()
 
 
-# --- MODEL (3 Layer / 5x5) ---
+# --- MODEL ---
 class Conv2DNet(nn.Module):
     def __init__(self, num_class=3):
         super(Conv2DNet, self).__init__()
@@ -59,132 +61,175 @@ try:
         model.load_state_dict(ckpt["model"][0] if isinstance(ckpt["model"], list) else ckpt["model"])
     else:
         model.load_state_dict(ckpt)
-    print("Model loaded successfully.")
 except Exception as e:
-    print(f"Error loading model: {e}")
+    print(f"Error: {e}")
     sys.exit(1)
-
 model.eval()
 
+# # --- TRANSFORMS ---
+# resampler = torchaudio.transforms.Resample(orig_freq=SYSTEM_RATE, new_freq=MODEL_RATE).to(device)
+# transform = torchaudio.transforms.MelSpectrogram(sample_rate=MODEL_RATE, n_fft=512, hop_length=128, n_mels=40).to(
+#     device
+# )
 # --- TRANSFORMS ---
-# 1. Resampler: Converts 48k (System) -> 16k (Model)
 resampler = torchaudio.transforms.Resample(orig_freq=SYSTEM_RATE, new_freq=MODEL_RATE).to(device)
 
-# 2. MelSpectrogram: Must allow sample_rate=MODEL_RATE (16k)
-transform = torchaudio.transforms.MelSpectrogram(
-    sample_rate=MODEL_RATE, n_fft=512, hop_length=128, n_mels=40  # The AI sees 16000Hz data now
-).to(device)
+# Use AmplitudeToDB instead of manual Log. This matches standard training pipelines.
+to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80).to(device)
+
+transform = torchaudio.transforms.MelSpectrogram(sample_rate=MODEL_RATE, n_fft=512, hop_length=128, n_mels=40).to(
+    device
+)
 
 
+# Callback: Pushes small 0.1s chunks
 def audio_callback(indata, frames, time, status):
     if status:
         print(f"Status: {status}", file=sys.stderr)
-
-    # 1. Copy data
-    audio_chunk = indata[:, 0].copy()
-
-    # 2. Manual Gain
-    audio_chunk = audio_chunk * GAIN_FACTOR
-
-    # 3. Clip
-    audio_chunk = np.clip(audio_chunk, -1.0, 1.0)
-
-    data_queue.put(audio_chunk)
+    data_queue.put(indata[:, 0].copy())
 
 
 def main():
     # DEVICE SELECT
-    input_device_id = None
+    input_device_id = sd.default.device[0]
     devices = sd.query_devices()
-    print("\nScanning for 'CABLE Output'...")
     for i, dev in enumerate(devices):
         if "CABLE Output" in dev["name"] and dev["max_input_channels"] > 0:
             input_device_id = i
-            print(f"Found 'CABLE Output' ID: {i}")
+            print(f"Found CABLE Output: {i}")
             break
-    if input_device_id is None:
-        input_device_id = sd.default.device[0]
-        print(f"Using Default: {input_device_id}")
 
-    # GRAPH
+    # PLOT SETUP
     print("Opening Graph...")
     plt.ion()
-    fig, ax = plt.subplots(figsize=(10, 4))
-    y_data = deque([0] * HISTORY_SIZE, maxlen=HISTORY_SIZE)
-    (line,) = ax.step(np.arange(HISTORY_SIZE), y_data, where="post", color="blue", linewidth=2)
-    ax.set_yticks([0, 1, 2])
-    ax.set_yticklabels(list(CLASS_LABELS.values()))
-    ax.set_title(f"PyTorch Real-Time (Resampling {SYSTEM_RATE}->{MODEL_RATE})")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8))
 
-    # STREAM: Use SYSTEM_RATE and CAPTURE_SIZE
+    # Prediction History
+    y_data = deque([0] * HISTORY_SIZE, maxlen=HISTORY_SIZE)
+    (line,) = ax1.step(np.arange(HISTORY_SIZE), y_data, where="post", color="cyan", linewidth=2)
+    ax1.set_ylim(-0.5, 2.5)
+    ax1.set_yticks([0, 1, 2])
+    ax1.set_yticklabels(list(CLASS_LABELS.values()))
+    ax1.set_title("Live Prediction (Sliding Window)")
+
+    # Spectrogram
+    dummy_spec = np.zeros((40, 63))
+    im = ax2.imshow(dummy_spec, aspect="auto", origin="lower", cmap="inferno", vmin=-11.5, vmax=2.5)
+    ax2.set_title("Input (Filtered > 300Hz)")
+    ax2.set_xlabel("Time")
+
+    # BUFFER INITIALIZATION
+    # We hold 0.5s of audio in this buffer
+    rolling_buffer = np.zeros(WINDOW_SIZE, dtype=np.float32)
+
     stream = sd.InputStream(
         device=input_device_id,
         callback=audio_callback,
         channels=1,
         samplerate=SYSTEM_RATE,
-        blocksize=CAPTURE_SIZE,  # Captures 24000 samples (0.5s at 48k)
+        blocksize=STEP_SIZE,  # Captures small 0.1s chunks
     )
 
     with stream:
-        print(f"\nListening... Press Ctrl+C to stop.\n")
-        print(f"{'VOL':<8} | {'PREDICTION':<15} | {'CONF':<6} | {'RAW PROBS'}")
-        print("-" * 60)
+        print("\nListening...")
+        print(f"{'RMS':<8} | {'PRED':<10} | {'CONF':<6}")
+        print("-" * 30)
 
         while True:
             try:
-                # Get raw audio (numpy)
-                audio_np = data_queue.get_nowait()
+                # 1. Get new small chunk (0.1s)
+                new_chunk = data_queue.get_nowait()
 
-                # --- VOLUME CHECK ---
-                rms = np.sqrt(np.mean(audio_np**2))
+                # 2. Update Rolling Buffer (Shift Left, Append New)
+                rolling_buffer = np.roll(rolling_buffer, -len(new_chunk))
+                rolling_buffer[-len(new_chunk) :] = new_chunk
 
-                # --- PROCESSING ---
-                # 1. To Tensor (on GPU)
-                audio_tens = torch.tensor(audio_np).float().to(device)
+                # 3. Apply Gain
+                audio_proc = rolling_buffer * GAIN_FACTOR
+                audio_proc = np.clip(audio_proc, -1.0, 1.0)
 
-                # 2. Resample (48k -> 16k)
-                # This squashes the 24k samples down to 8k samples
+                # Check volume of just the new bit
+                rms = np.sqrt(np.mean(new_chunk**2))
+
+                # # 4. Process on GPU
+                # audio_tens = torch.tensor(audio_proc).float().to(device)
+
+                # # --- FREQUENCY FILTER (The Fix for Engine Noise) ---
+                # # High-pass filter at 300Hz to kill engine rumble
+                # audio_tens = torchaudio.functional.highpass_biquad(audio_tens, SYSTEM_RATE, cutoff_freq=300)
+
+                # # 5. Resample & Spectrogram
+                # audio_resampled = resampler(audio_tens)
+                # spec = transform(audio_resampled.unsqueeze(0))
+                # spec = torch.log(spec + 1e-9).unsqueeze(1)
+
+                # # 6. Shape Check
+                # if spec.shape[3] > 48:
+                #     spec_in = spec[:, :, :, :48]
+                # elif spec.shape[3] < 48:
+                #     spec_in = F.pad(spec, (0, 48 - spec.shape[3]))
+                # else:
+                #     spec_in = spec
+
+                # # 7. Inference
+                # with torch.no_grad():
+                #     probs = torch.softmax(model(spec_in), dim=1).cpu().numpy()[0]
+                #     pred = int(np.argmax(probs))
+
+                # 4. Process on GPU
+                audio_tens = torch.tensor(audio_proc).float().to(device)
+
+                # High-pass filter (Keep this, it's good for engine noise)
+                audio_tens = torchaudio.functional.highpass_biquad(audio_tens, SYSTEM_RATE, cutoff_freq=300)
+
+                # 5. Resample & Spectrogram
                 audio_resampled = resampler(audio_tens)
-
-                # 3. Mel Spectrogram
                 spec = transform(audio_resampled.unsqueeze(0))
-                spec = torch.log(spec + 1e-9).unsqueeze(1)
 
-                # 4. Shape Fix (Ensure exactly 48 width)
+                # CRITICAL CHANGE: Use DB scale, not raw Log
+                spec = to_db(spec).unsqueeze(1)
+
+                # 6. Shape Fix (CRITICAL: Slice from the END)
+                # We want the LAST 48 frames (the newest audio), not the first 48
                 if spec.shape[3] > 48:
-                    spec = spec[:, :, :, :48]
+                    spec_in = spec[:, :, :, -48:]  # <--- Changed :48 to -48:
                 elif spec.shape[3] < 48:
-                    spec = F.pad(spec, (0, 48 - spec.shape[3]))
+                    spec_in = F.pad(spec, (0, 48 - spec.shape[3]))
+                else:
+                    spec_in = spec
 
-                # 5. Inference
+                # 7. Inference
                 with torch.no_grad():
-                    probs = torch.softmax(model(spec), dim=1).cpu().numpy()[0]
+                    # Check what the model actually outputs
+                    logits = model(spec_in)
+                    probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                     pred = int(np.argmax(probs))
 
-                # UPDATE GRAPH
+                # Update Plots
                 y_data.append(pred)
                 line.set_ydata(y_data)
 
-                # PRINT
-                raw_s = f"[{probs[0]:.2f}, {probs[1]:.2f}, {probs[2]:.2f}]"
-                print(f"{rms:.4f}   | {CLASS_LABELS[pred]:<15} | {probs[pred]:.2f}   | {raw_s}")
+                spec_vis = spec_in.squeeze().cpu().numpy()
+                im.set_data(spec_vis)
+                im.set_clim(vmin=spec_vis.min(), vmax=spec_vis.max())
+
+                if pred != 0:  # Print only interesting events
+                    print(f"{rms:.4f}   | {CLASS_LABELS[pred]:<10} | {probs[pred]:.2f}")
 
                 fig.canvas.draw_idle()
                 fig.canvas.flush_events()
 
             except queue.Empty:
-                plt.pause(0.01)
+                plt.pause(0.001)
+            except KeyboardInterrupt:
+                break
             except Exception as e:
-                print(f"Error: {e}")
+                print(e)
                 break
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-
+    main()
 
 # import sounddevice as sd
 # import numpy as np
@@ -200,16 +245,21 @@ if __name__ == "__main__":
 
 # # --- CONFIG ---
 # MODEL_PATH = Path("C:/Users/egrandjean/Desktop/BattleSound_model/BattleSound/models/best_model.pt")
-# SYSTEM_RATE = 48000
-# MODEL_RATE = 16000
-# DURATION = 0.5
-# CHUNK_SIZE = int(MODEL_RATE * DURATION)
+
+# # AUDIO RATES
+# SYSTEM_RATE = 48000  # Input device rate (e.g. CABLE Output)
+# MODEL_RATE = 16000  # AI Model training rate
+# DURATION = 0.5  # Seconds per chunk
+# CAPTURE_SIZE = int(SYSTEM_RATE * DURATION)  # Samples to capture per chunk
+
 # CLASS_LABELS = {0: "Nothing", 1: "Voices", 2: "Effects"}
 # HISTORY_SIZE = 100
+# GAIN_FACTOR = 5.0
+
 # data_queue = queue.Queue()
 
 
-# # --- MODEL (3 Layer / 5x5) ---
+# # --- MODEL DEFINITION ---
 # class Conv2DNet(nn.Module):
 #     def __init__(self, num_class=3):
 #         super(Conv2DNet, self).__init__()
@@ -227,59 +277,53 @@ if __name__ == "__main__":
 #         return x
 
 
-# # --- SETUP ---
+# # --- INITIALIZATION ---
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # print(f"Loading model on {device}...")
+
 # model = Conv2DNet(3).to(device)
-# ckpt = torch.load(MODEL_PATH, map_location=device)
-# if isinstance(ckpt, list):
-#     model.load_state_dict(ckpt[0])
-# elif isinstance(ckpt, dict) and "model" in ckpt:
-#     model.load_state_dict(ckpt["model"][0] if isinstance(ckpt["model"], list) else ckpt["model"])
-# else:
-#     model.load_state_dict(ckpt)
+# try:
+#     ckpt = torch.load(MODEL_PATH, map_location=device)
+#     if isinstance(ckpt, list):
+#         model.load_state_dict(ckpt[0])
+#     elif isinstance(ckpt, dict) and "model" in ckpt:
+#         model.load_state_dict(ckpt["model"][0] if isinstance(ckpt["model"], list) else ckpt["model"])
+#     else:
+#         model.load_state_dict(ckpt)
+#     print("Model loaded.")
+# except Exception as e:
+#     print(f"Error loading model: {e}")
+#     sys.exit(1)
 # model.eval()
 
-# transform = torchaudio.transforms.MelSpectrogram(sample_rate=SAMPLE_RATE, n_fft=512, hop_length=128, n_mels=40).to(
+# # --- TRANSFORMS ---
+# # 1. Resampler: 48k -> 16k
+# resampler = torchaudio.transforms.Resample(orig_freq=SYSTEM_RATE, new_freq=MODEL_RATE).to(device)
+
+# # 2. MelSpectrogram: Standard settings for 16k audio
+# transform = torchaudio.transforms.MelSpectrogram(sample_rate=MODEL_RATE, n_fft=512, hop_length=128, n_mels=40).to(
 #     device
 # )
-
-
-# # def audio_callback(indata, frames, time, status):
-# #     if status:
-# #         print(f"Status: {status}", file=sys.stderr)
-# #     data_queue.put(indata[:, 0].copy())
-# # ==========================================
-# # UPDATED CALLBACK WITH GAIN BOOST
-# # ==========================================
-# GAIN_FACTOR = 5.0  # Multiplies volume by 5. Try 2.0, 5.0, or 10.0
 
 
 # def audio_callback(indata, frames, time, status):
 #     if status:
 #         print(f"Status: {status}", file=sys.stderr)
 
-#     # 1. Copy data
-#     audio_chunk = indata[:, 0].copy()
+#     # Copy and Gain
+#     audio_chunk = indata[:, 0].copy() * GAIN_FACTOR
 
-#     # 2. Apply Manual Gain (Boost Volume)
-#     audio_chunk = audio_chunk * GAIN_FACTOR
-
-#     # 3. Clip to prevent distortion (Max is 1.0)
+#     # Clip to keep valid range
 #     audio_chunk = np.clip(audio_chunk, -1.0, 1.0)
-
-#     # 4. Optional: Print if clipping (Debug)
-#     # if np.max(np.abs(audio_chunk)) >= 1.0:
-#     #     print("Warning: Audio Clipping!", file=sys.stderr)
 
 #     data_queue.put(audio_chunk)
 
 
 # def main():
-#     # DEVICE SELECT
+#     # DEVICE SELECTION
 #     input_device_id = None
 #     devices = sd.query_devices()
-#     print("\nScanning for 'CABLE Output'...")
+#     print("\nScanning devices...")
 #     for i, dev in enumerate(devices):
 #         if "CABLE Output" in dev["name"] and dev["max_input_channels"] > 0:
 #             input_device_id = i
@@ -287,60 +331,97 @@ if __name__ == "__main__":
 #             break
 #     if input_device_id is None:
 #         input_device_id = sd.default.device[0]
-#         print(f"Using Default: {input_device_id}")
+#         print(f"Using Default Device ID: {input_device_id}")
 
-#     # GRAPH
-#     print("Opening Graph...")
+#     # --- PLOT SETUP ---
+#     print("Opening Visual Debugger...")
 #     plt.ion()
-#     fig, ax = plt.subplots(figsize=(10, 4))
-#     y_data = deque([0] * HISTORY_SIZE, maxlen=HISTORY_SIZE)
-#     (line,) = ax.step(np.arange(HISTORY_SIZE), y_data, where="post", color="blue", linewidth=2)
-#     ax.set_yticks([0, 1, 2])
-#     ax.set_yticklabels(list(CLASS_LABELS.values()))
-#     ax.set_title("PyTorch Real-Time")
+#     # Create 2 subplots: Top for Predictions, Bottom for Spectrogram
+#     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8))
 
+#     # 1. Prediction Graph
+#     y_data = deque([0] * HISTORY_SIZE, maxlen=HISTORY_SIZE)
+#     (line,) = ax1.step(np.arange(HISTORY_SIZE), y_data, where="post", color="cyan", linewidth=2)
+#     ax1.set_ylim(-0.5, 2.5)
+#     ax1.set_yticks([0, 1, 2])
+#     ax1.set_yticklabels(list(CLASS_LABELS.values()))
+#     ax1.set_title("Live Prediction")
+#     ax1.grid(True, alpha=0.3)
+
+#     # 2. Spectrogram Graph
+#     # Initialize with zeros. Shape: (n_mels=40, time_steps=48 approx)
+#     dummy_spec = np.zeros((40, 63))  # 63 is approx width for 0.5s at 16k
+#     im = ax2.imshow(dummy_spec, aspect="auto", origin="lower", cmap="inferno", vmin=-11.5, vmax=2.5)
+#     ax2.set_title(f"What the AI Sees (MelSpec @ {MODEL_RATE}Hz)")
+#     ax2.set_xlabel("Time")
+#     ax2.set_ylabel("Mel Frequency")
+
+#     plt.tight_layout()
+
+#     # STREAM START
 #     stream = sd.InputStream(
-#         device=input_device_id, callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE
+#         device=input_device_id, callback=audio_callback, channels=1, samplerate=SYSTEM_RATE, blocksize=CAPTURE_SIZE
 #     )
 
 #     with stream:
 #         print(f"\nListening... Press Ctrl+C to stop.\n")
-#         print(f"{'VOL':<8} | {'PREDICTION':<15} | {'CONF':<6} | {'RAW PROBS'}")
-#         print("-" * 60)
+#         print(f"{'VOL':<8} | {'PREDICTION':<15} | {'CONF':<6}")
+#         print("-" * 40)
 
 #         while True:
 #             try:
-#                 audio = data_queue.get_nowait()
+#                 # 1. Get Audio
+#                 audio_np = data_queue.get_nowait()
+#                 rms = np.sqrt(np.mean(audio_np**2))
 
-#                 # --- VOLUME CHECK (Debug) ---
-#                 rms = np.sqrt(np.mean(audio**2))
+#                 # 2. Process to Tensor
+#                 audio_tens = torch.tensor(audio_np).float().to(device)
 
-#                 # INFERENCE
-#                 tens = torch.tensor(audio).float().to(device)
-#                 spec = transform(tens.unsqueeze(0))
-#                 spec = torch.log(spec + 1e-9).unsqueeze(1)
+#                 # 3. Resample (Crucial Step)
+#                 audio_resampled = resampler(audio_tens)
 
+#                 # 4. Create Spectrogram
+#                 spec = transform(audio_resampled.unsqueeze(0))
+#                 spec = torch.log(spec + 1e-9).unsqueeze(1)  # Log scale
+
+#                 # 5. Fix Dimensions for Model (Exact 48 width)
+#                 # (We keep a copy for visualization before padding/cutting if we want,
+#                 # but let's visualize exactly what goes into the model)
 #                 if spec.shape[3] > 48:
-#                     spec = spec[:, :, :, :48]
+#                     spec_in = spec[:, :, :, :48]
 #                 elif spec.shape[3] < 48:
-#                     spec = F.pad(spec, (0, 48 - spec.shape[3]))
+#                     spec_in = F.pad(spec, (0, 48 - spec.shape[3]))
+#                 else:
+#                     spec_in = spec
 
+#                 # 6. Inference
 #                 with torch.no_grad():
-#                     probs = torch.softmax(model(spec), dim=1).cpu().numpy()[0]
+#                     probs = torch.softmax(model(spec_in), dim=1).cpu().numpy()[0]
 #                     pred = int(np.argmax(probs))
 
+#                 # --- UPDATE VISUALS ---
+
+#                 # Update Line Graph
 #                 y_data.append(pred)
 #                 line.set_ydata(y_data)
 
-#                 # PRINT
-#                 raw_s = f"[{probs[0]:.2f}, {probs[1]:.2f}, {probs[2]:.2f}]"
-#                 print(f"{rms:.4f}   | {CLASS_LABELS[pred]:<15} | {probs[pred]:.2f}   | {raw_s}")
+#                 # Update Spectrogram
+#                 # Squeeze to (40, 48) and move to CPU numpy
+#                 spec_vis = spec_in.squeeze().cpu().numpy()
+#                 im.set_data(spec_vis)
+#                 im.set_clim(vmin=spec_vis.min(), vmax=spec_vis.max())  # Auto-contrast
 
+#                 # Print Stats
+#                 print(f"{rms:.4f}   | {CLASS_LABELS[pred]:<15} | {probs[pred]:.2f}")
+
+#                 # Draw
 #                 fig.canvas.draw_idle()
 #                 fig.canvas.flush_events()
+
 #             except queue.Empty:
 #                 plt.pause(0.01)
-#             except Exception:
+#             except Exception as e:
+#                 print(f"Error: {e}")
 #                 break
 
 
@@ -349,465 +430,3 @@ if __name__ == "__main__":
 #         main()
 #     except KeyboardInterrupt:
 #         print("\nStopped.")
-
-
-# # import sounddevice as sd
-# # import numpy as np
-# # import torch
-# # import torch.nn as nn
-# # import torch.nn.functional as F
-# # import torchaudio
-# # import matplotlib.pyplot as plt
-# # import queue
-# # import sys
-# # from collections import deque
-# # from pathlib import Path
-
-# # # --- 1. CONFIGURATION ---
-# # MODEL_PATH = Path("C:/Users/egrandjean/Desktop/BattleSound_model/BattleSound/models/best_model.pt")
-# # SAMPLE_RATE = 16000
-# # DURATION = 0.5
-# # CHUNK_SIZE = int(SAMPLE_RATE * DURATION)
-
-# # # Mapping: 0=Nothing, 1=Voices, 2=Effects
-# # CLASS_LABELS = {0: "Nothing", 1: "Voices", 2: "Effects"}
-# # HISTORY_SIZE = 100
-
-# # data_queue = queue.Queue()
-
-
-# # # --- 2. MODEL DEFINITION (3 Layers, Kernel 5x5) ---
-# # class Conv2DNet(nn.Module):
-# #     def __init__(self, num_class=3):
-# #         super(Conv2DNet, self).__init__()
-# #         self.layer1 = nn.Sequential(
-# #             nn.Conv2d(1, 10, kernel_size=5, stride=1, padding=2), nn.BatchNorm2d(10), nn.ReLU(), nn.MaxPool2d(2)
-# #         )
-# #         self.layer2 = nn.Sequential(
-# #             nn.Conv2d(10, 20, kernel_size=5, stride=1, padding=2), nn.BatchNorm2d(20), nn.ReLU(), nn.MaxPool2d(2)
-# #         )
-# #         self.layer3 = nn.Sequential(
-# #             nn.Conv2d(20, 40, kernel_size=5, stride=1, padding=2), nn.BatchNorm2d(40), nn.ReLU(), nn.MaxPool2d(2)
-# #         )
-# #         self.fc1 = nn.Linear(1200, 256)
-# #         self.fc2 = nn.Linear(256, num_class)
-# #         self.dropout = nn.Dropout(0.5)
-
-# #     def forward(self, x):
-# #         x = self.layer1(x)
-# #         x = self.layer2(x)
-# #         x = self.layer3(x)
-# #         x = x.view(x.size(0), -1)
-# #         x = F.relu(self.fc1(x))
-# #         x = self.dropout(x)
-# #         x = self.fc2(x)
-# #         return x
-
-
-# # # --- 3. LOAD MODEL ---
-# # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# # print(f"Loading model on {device}...")
-
-# # model = Conv2DNet(num_class=3).to(device)
-# # checkpoint = torch.load(MODEL_PATH, map_location=device)
-
-# # if isinstance(checkpoint, list):
-# #     model.load_state_dict(checkpoint[0])
-# # elif isinstance(checkpoint, dict) and "model" in checkpoint:
-# #     if isinstance(checkpoint["model"], list):
-# #         model.load_state_dict(checkpoint["model"][0])
-# #     else:
-# #         model.load_state_dict(checkpoint["model"])
-# # else:
-# #     model.load_state_dict(checkpoint)
-
-# # model.eval()
-
-# # transform = torchaudio.transforms.MelSpectrogram(sample_rate=SAMPLE_RATE, n_fft=512, hop_length=128, n_mels=40).to(
-# #     device
-# # )
-
-
-# # # --- 4. AUDIO CALLBACK ---
-# # def audio_callback(indata, frames, time, status):
-# #     if status:
-# #         print(f"Audio Status: {status}", file=sys.stderr)
-# #     data_queue.put(indata[:, 0].copy())
-
-
-# # # --- 5. MAIN LOOP ---
-# # def main():
-# #     # ==========================================
-# #     # AUTOMATIC DEVICE SELECTION (CABLE Output)
-# #     # ==========================================
-# #     input_device_id = None
-# #     device_list = sd.query_devices()
-
-# #     print("\nScanning for 'CABLE Output'...")
-# #     for i, device_info in enumerate(device_list):
-# #         # Look for CABLE Output (which acts as input loopback)
-# #         if "CABLE Output" in device_info["name"]:
-# #             if device_info["max_input_channels"] > 0:
-# #                 input_device_id = i
-# #                 print(f"Found 'CABLE Output' device with ID: {input_device_id}")
-# #                 break
-
-# #     if input_device_id is None:
-# #         print("Could not find 'CABLE Output'. Falling back to default system input.")
-# #         input_device_id = sd.default.device[0]
-
-# #     # ==========================================
-# #     # GRAPH SETUP
-# #     # ==========================================
-# #     print("\nOpening Graph Window...")
-# #     plt.ion()
-# #     fig, ax = plt.subplots(figsize=(10, 4))
-
-# #     y_data = deque([0] * HISTORY_SIZE, maxlen=HISTORY_SIZE)
-# #     x_data = np.arange(HISTORY_SIZE)
-
-# #     # "Step" plot for clean transitions between classes
-# #     (line,) = ax.step(x_data, y_data, where="post", color="blue", linewidth=2)
-
-# #     # Configure Axes
-# #     ax.set_ylim(-0.5, 2.5)
-# #     ax.set_yticks([0, 1, 2])
-# #     ax.set_yticklabels([CLASS_LABELS[0], CLASS_LABELS[1], CLASS_LABELS[2]])
-# #     ax.set_ylabel("Detected Class")
-# #     ax.set_xlabel("Time (Chunks)")
-# #     ax.set_title(f"Listening on Device {input_device_id}")
-# #     ax.grid(True, axis="y", linestyle="--", alpha=0.7)
-
-# #     # Start Stream
-# #     stream = sd.InputStream(
-# #         device=input_device_id, callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE
-# #     )
-
-# #     with stream:
-# #         print(f"\nListening... Press Ctrl+C to stop.\n")
-# #         print(f"{'PREDICTION':<15} | {'CONFIDENCE':<10} | {'RAW PROBS'}")
-# #         print("-" * 50)
-
-# #         while True:
-# #             try:
-# #                 audio_data = data_queue.get_nowait()
-
-# #                 # --- INFERENCE ---
-# #                 tensor = torch.tensor(audio_data).float().to(device)
-# #                 spec = transform(tensor.unsqueeze(0))
-# #                 spec = torch.log(spec + 1e-9).unsqueeze(1)
-
-# #                 # Fix Shape (Force 48 frames)
-# #                 target_width = 48
-# #                 if spec.shape[3] > target_width:
-# #                     spec = spec[:, :, :, :target_width]
-# #                 elif spec.shape[3] < target_width:
-# #                     spec = F.pad(spec, (0, target_width - spec.shape[3]))
-
-# #                 with torch.no_grad():
-# #                     output = model(spec)
-# #                     probs = torch.softmax(output, dim=1).cpu().numpy()[0]
-# #                     prediction = int(np.argmax(probs))
-# #                     confidence = probs[prediction]
-
-# #                 # --- UPDATE GRAPH ---
-# #                 y_data.append(prediction)
-# #                 line.set_ydata(y_data)
-
-# #                 # --- TERMINAL DEBUG ---
-# #                 raw_str = f"[{probs[0]:.2f}, {probs[1]:.2f}, {probs[2]:.2f}]"
-# #                 print(f"{CLASS_LABELS[prediction]:<15} | {confidence:.2f}       | {raw_str}")
-
-# #                 # Redraw
-# #                 fig.canvas.draw_idle()
-# #                 fig.canvas.flush_events()
-
-# #             except queue.Empty:
-# #                 plt.pause(0.01)
-# #             except Exception as e:
-# #                 print(f"Error: {e}")
-# #                 break
-
-
-# # if __name__ == "__main__":
-# #     try:
-# #         main()
-# #     except KeyboardInterrupt:
-# #         print("\nStopped.")
-
-# # # import sounddevice as sd
-# # # import numpy as np
-# # # import torch
-# # # import torch.nn as nn
-# # # import torch.nn.functional as F
-# # # import torchaudio
-# # # import matplotlib.pyplot as plt
-# # # import queue
-# # # import sys
-# # # from collections import deque
-# # # from pathlib import Path
-
-# # # # --- 1. CONFIGURATION ---
-# # # # Use raw string r"..." to fix Windows path issues
-# # # MODEL_PATH = Path("C:/Users/egrandjean/Desktop/BattleSound_model/BattleSound/models/best_model.pt")
-# # # SAMPLE_RATE = 16000
-# # # DURATION = 0.5
-# # # CHUNK_SIZE = int(SAMPLE_RATE * DURATION)
-# # # CLASSES = ["Class 0", "Class 1", "Class 2"]
-# # # HISTORY_SIZE = 50  # How many points to show on graph (50 * 0.5s = 25 seconds history)
-
-# # # data_queue = queue.Queue()
-
-
-# # # # --- 2. MODEL DEFINITION (Corrected: 3 Layers, Kernel 5x5) ---
-# # # class Conv2DNet(nn.Module):
-# # #     def __init__(self, num_class=3):
-# # #         super(Conv2DNet, self).__init__()
-
-# # #         # Layer 1: Conv(1->10, k=5) -> BN -> ReLU -> MaxPool
-# # #         self.layer1 = nn.Sequential(
-# # #             nn.Conv2d(1, 10, kernel_size=5, stride=1, padding=2), nn.BatchNorm2d(10), nn.ReLU(), nn.MaxPool2d(2)
-# # #         )
-
-# # #         # Layer 2: Conv(10->20, k=5) -> BN -> ReLU -> MaxPool
-# # #         self.layer2 = nn.Sequential(
-# # #             nn.Conv2d(10, 20, kernel_size=5, stride=1, padding=2), nn.BatchNorm2d(20), nn.ReLU(), nn.MaxPool2d(2)
-# # #         )
-
-# # #         # Layer 3: Conv(20->40, k=5) -> BN -> ReLU -> MaxPool
-# # #         self.layer3 = nn.Sequential(
-# # #             nn.Conv2d(20, 40, kernel_size=5, stride=1, padding=2), nn.BatchNorm2d(40), nn.ReLU(), nn.MaxPool2d(2)
-# # #         )
-
-# # #         # FC Layers (Weights match 1200 inputs)
-# # #         self.fc1 = nn.Linear(1200, 256)
-# # #         self.fc2 = nn.Linear(256, num_class)
-# # #         self.dropout = nn.Dropout(0.5)
-
-# # #     def forward(self, x):
-# # #         x = self.layer1(x)
-# # #         x = self.layer2(x)
-# # #         x = self.layer3(x)
-# # #         x = x.view(x.size(0), -1)
-# # #         x = F.relu(self.fc1(x))
-# # #         x = self.dropout(x)
-# # #         x = self.fc2(x)
-# # #         return x
-
-
-# # # # --- 3. LOAD MODEL (Robust Version) ---
-# # # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# # # print(f"Loading model on {device}...")
-
-# # # model = Conv2DNet(num_class=len(CLASSES)).to(device)
-# # # checkpoint = torch.load(MODEL_PATH, map_location=device)
-
-# # # # Handle different save formats (List vs Dict)
-# # # if isinstance(checkpoint, list):
-# # #     model.load_state_dict(checkpoint[0])
-# # # elif isinstance(checkpoint, dict) and "model" in checkpoint:
-# # #     if isinstance(checkpoint["model"], list):
-# # #         model.load_state_dict(checkpoint["model"][0])
-# # #     else:
-# # #         model.load_state_dict(checkpoint["model"])
-# # # else:
-# # #     model.load_state_dict(checkpoint)
-
-# # # model.eval()
-
-# # # # Spectrogram Transform
-# # # transform = torchaudio.transforms.MelSpectrogram(sample_rate=SAMPLE_RATE, n_fft=512, hop_length=128, n_mels=40).to(
-# # #     device
-# # # )
-
-
-# # # # --- 4. AUDIO CALLBACK ---
-# # # def audio_callback(indata, frames, time, status):
-# # #     if status:
-# # #         print(status, file=sys.stderr)
-# # #     data_queue.put(indata[:, 0].copy())
-
-
-# # # # --- 5. MAIN VISUALIZATION LOOP ---
-# # # def main():
-# # #     print("Opening Rolling Graph Window...")
-# # #     plt.ion()
-# # #     fig, ax = plt.subplots(figsize=(10, 5))
-
-# # #     # Setup Data buffers for 3 Classes
-# # #     y_data = [deque([0] * HISTORY_SIZE, maxlen=HISTORY_SIZE) for _ in range(len(CLASSES))]
-# # #     x_data = list(range(HISTORY_SIZE))
-
-# # #     # Create Lines
-# # #     lines = []
-# # #     colors = ["r", "g", "b"]  # Class 0=Red, 1=Green, 2=Blue
-# # #     for i in range(len(CLASSES)):
-# # #         (line,) = ax.plot(x_data, y_data[i], label=CLASSES[i], color=colors[i], linewidth=2)
-# # #         lines.append(line)
-
-# # #     ax.set_ylim(0, 1.1)
-# # #     ax.set_ylabel("Probability")
-# # #     ax.set_xlabel("Time (Frames)")
-# # #     ax.legend(loc="upper right")
-# # #     ax.set_title("Real-Time Event Detection")
-# # #     ax.grid(True)
-
-# # #     stream = sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE)
-
-# # #     with stream:
-# # #         print("Listening... Close the graph window to stop.")
-# # #         while True:
-# # #             try:
-# # #                 audio_data = data_queue.get_nowait()
-
-# # #                 # --- INFERENCE ---
-# # #                 tensor = torch.tensor(audio_data).float().to(device)
-# # #                 spec = transform(tensor.unsqueeze(0))
-# # #                 spec = torch.log(spec + 1e-9).unsqueeze(1)
-
-# # #                 # *** CRITICAL FIX: FORCE SHAPE TO 48 FRAMES ***
-# # #                 # Your microphone gives ~56 frames. The model needs exactly 48.
-# # #                 target_width = 48
-# # #                 current_width = spec.shape[3]
-
-# # #                 if current_width > target_width:
-# # #                     spec = spec[:, :, :, :target_width]  # Crop
-# # #                 elif current_width < target_width:
-# # #                     pad_amount = target_width - current_width
-# # #                     spec = F.pad(spec, (0, pad_amount))  # Pad
-
-# # #                 # Run Model
-# # #                 with torch.no_grad():
-# # #                     output = model(spec)
-# # #                     probs = torch.softmax(output, dim=1).cpu().numpy()[0]
-
-# # #                 # --- UPDATE GRAPH ---
-# # #                 for i in range(len(CLASSES)):
-# # #                     y_data[i].append(probs[i])  # Add new point
-# # #                     lines[i].set_ydata(y_data[i])  # Update line
-
-# # #                 fig.canvas.draw_idle()
-# # #                 fig.canvas.flush_events()
-
-# # #             except queue.Empty:
-# # #                 plt.pause(0.01)
-# # #             except Exception as e:
-# # #                 print(f"Error: {e}")
-# # #                 break
-
-
-# # # if __name__ == "__main__":
-# # #     try:
-# # #         main()
-# # #     except KeyboardInterrupt:
-# # #         print("\nStopped.")
-
-
-# # # # import sounddevice as sd
-# # # # import numpy as np
-# # # # import torch
-# # # # import torch.nn as nn
-# # # # import torchaudio
-# # # # import torch.nn.functional as F
-
-
-# # # # # --- 1. MODEL DEFINITION (Must match your training) ---
-# # # # class Conv2DNet(nn.Module):
-# # # #     def __init__(self, num_class=3):
-# # # #         super(Conv2DNet, self).__init__()
-# # # #         # Adjusted to match the 1200 input size we found earlier
-# # # #         self.conv1 = nn.Conv2d(1, 16, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-# # # #         self.conv2 = nn.Conv2d(16, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
-# # # #         self.pool = nn.MaxPool2d(2, 2)
-
-# # # #         # Calculate flat features based on input 128xSomething
-# # # #         # For 0.5s duration, we determined this leads to 1200 features
-# # # #         self.fc1 = nn.Linear(1200, 256)
-# # # #         self.fc2 = nn.Linear(256, num_class)
-# # # #         self.dropout = nn.Dropout(0.5)
-
-# # # #     def forward(self, x):
-# # # #         # x shape: [Batch, 1, Freq, Time]
-# # # #         x = self.pool(F.relu(self.conv1(x)))
-# # # #         x = self.pool(F.relu(self.conv2(x)))
-# # # #         x = x.view(x.size(0), -1)  # Flatten
-# # # #         x = F.relu(self.fc1(x))
-# # # #         x = self.dropout(x)
-# # # #         x = self.fc2(x)
-# # # #         return x
-
-
-# # # # # --- 2. CONFIGURATION ---
-# # # # MODEL_PATH = "best_model.pt"
-# # # # SAMPLE_RATE = 16000
-# # # # DURATION = 0.5  # Seconds (matches your training)
-# # # # CHUNK_SIZE = int(SAMPLE_RATE * DURATION)
-# # # # CLASSES = ["Class 0", "Class 1", "Class 2"]  # Rename these to Bomb, Gunshot, etc.
-
-# # # # # Load Model
-# # # # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# # # # print(f"Loading model on {device}...")
-
-# # # # # Initialize and load weights
-# # # # model = Conv2DNet(num_class=len(CLASSES)).to(device)
-# # # # checkpoint = torch.load(MODEL_PATH, map_location=device)
-
-# # # # # Handle loading state_dict whether it's wrapped in 'model' key or not
-# # # # if "model" in checkpoint:
-# # # #     # If the saved dict is a list (DataParallel), take the first element
-# # # #     if isinstance(checkpoint["model"], list):
-# # # #         model.load_state_dict(checkpoint["model"][0])
-# # # #     else:
-# # # #         model.load_state_dict(checkpoint["model"])
-# # # # else:
-# # # #     model.load_state_dict(checkpoint)
-
-# # # # model.eval()
-
-# # # # # Spectrogram Transformer (Matches BattleSound config)
-# # # # transform = torchaudio.transforms.MelSpectrogram(sample_rate=SAMPLE_RATE, n_fft=512, hop_length=128, n_mels=40).to(
-# # # #     device
-# # # # )
-
-
-# # # # def process_audio(indata, frames, time, status):
-# # # #     if status:
-# # # #         print(status)
-
-# # # #     # 1. Prepare Audio Tensor
-# # # #     # indata is shape (Frames, Channels). Take channel 0.
-# # # #     audio_tensor = torch.tensor(indata[:, 0]).float().to(device)
-
-# # # #     # 2. Preprocess (Make Spectrogram)
-# # # #     # Unsqueeze to add batch dimension [1, Length]
-# # # #     spec = transform(audio_tensor.unsqueeze(0))
-# # # #     # Log conversion (Log-Mel)
-# # # #     spec = torch.log(spec + 1e-9)
-# # # #     # Add channel dim: [1, 1, Freq, Time]
-# # # #     spec = spec.unsqueeze(1)
-
-# # # #     # 3. Inference
-# # # #     with torch.no_grad():
-# # # #         output = model(spec)
-# # # #         probs = torch.softmax(output, dim=1).cpu().numpy()[0]
-# # # #         prediction = np.argmax(probs)
-
-# # # #     # 4. Display Result
-# # # #     score = probs[prediction]
-# # # #     if score > 0.5:  # Only print if confident
-# # # #         print(f"Detected: {CLASSES[prediction]} ({score:.2f})")
-# # # #         # Visual Bar
-# # # #         bar = ["|" if i == prediction else "." for i in range(len(CLASSES))]
-# # # #         print(f"[{''.join(bar)}] {probs}")
-
-
-# # # # # --- 3. START STREAM ---
-# # # # print(f"Listening... (Press Ctrl+C to stop)")
-# # # # try:
-# # # #     with sd.InputStream(callback=process_audio, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE):
-# # # #         while True:
-# # # #             sd.sleep(1000)
-# # # # except KeyboardInterrupt:
-# # # #     print("\nStopped.")
-# # # # except Exception as e:
-# # # #     print(f"Error: {e}")
